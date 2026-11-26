@@ -1,4 +1,4 @@
-name: Linux RDP (VNC via Tailscale)
+name: Windows RDP (via Tailscale)
 
 on:
   workflow_dispatch:
@@ -12,20 +12,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-rdp
+  group: windows-rdp
   cancel-in-progress: true
 
 defaults:
   run:
-    shell: bash
+    shell: pwsh
 
 jobs:
-  linux-rdp:
-    runs-on: ubuntu-latest
+  windows-rdp:
+    runs-on: windows-latest
     timeout-minutes: 360
     env:
-      VNC_DISPLAY: '1'
-      VNC_PORT: '5901'
+      RDP_PORT: '3389'
     steps:
       - name: Validate secrets and inputs
         env:
@@ -33,129 +32,154 @@ jobs:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
           MINUTES_IN: ${{ inputs.minutes }}
         run: |
-          [ -n "$VNC_PASSWORD" ] || { echo "::error::VNC_PASSWORD secret is not set"; exit 1; }
-          [ -n "$TS_AUTHKEY" ] || { echo "::error::TS_AUTHKEY secret is not set (Tailscale admin console -> Settings -> Keys)"; exit 1; }
-          MINUTES="${MINUTES_IN:-300}"
-          case "$MINUTES" in ''|*[!0-9]*) MINUTES=300 ;; esac
-          [ "$MINUTES" -lt 1 ] && MINUTES=1
-          [ "$MINUTES" -gt 350 ] && MINUTES=350
-          echo "SESSION_MINUTES=$MINUTES" >> "$GITHUB_ENV"
+          if ([string]::IsNullOrEmpty($env:VNC_PASSWORD)) {
+            Write-Error "VNC_PASSWORD secret is not set"
+            exit 1
+          }
+          if ([string]::IsNullOrEmpty($env:TS_AUTHKEY)) {
+            Write-Error "TS_AUTHKEY secret is not set (Tailscale admin console -> Settings -> Keys)"
+            exit 1
+          }
+          $minutes = 300
+          [int]::TryParse($env:MINUTES_IN, [ref]$minutes) | Out-Null
+          if ($minutes -lt 1) { $minutes = 1 }
+          if ($minutes -gt 350) { $minutes = 350 }
+          "SESSION_MINUTES=$minutes" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Install desktop, VNC and SSH
+      - name: Keep system awake
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            xfce4 xfce4-goodies dbus-x11 \
-            tigervnc-standalone-server tigervnc-common \
-            openssh-server
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
 
-      - name: Configure and start VNC desktop
+      - name: Create login account
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          mkdir -p ~/.vnc
-          echo "$VNC_PASSWORD" | vncpasswd -f > ~/.vnc/passwd
-          chmod 600 ~/.vnc/passwd
+          $NewUser = "ciadmin"
+          $SecurePw = ConvertTo-SecureString $env:VNC_PASSWORD -AsPlainText -Force
 
-          cat > ~/.vnc/xstartup <<'EOF'
-          #!/bin/sh
-          unset SESSION_MANAGER
-          unset DBUS_SESSION_BUS_ADDRESS
-          exec startxfce4
-          EOF
-          chmod +x ~/.vnc/xstartup
+          if (Get-LocalUser -Name $NewUser -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $NewUser -Password $SecurePw
+            Write-Host "Reset password for existing user '$NewUser'"
+          } else {
+            New-LocalUser -Name $NewUser -Password $SecurePw -FullName "CI Admin" -PasswordNeverExpires -AccountNeverExpires
+            Write-Host "Created user '$NewUser'"
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $NewUser -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $NewUser -ErrorAction SilentlyContinue
 
-          vncserver ":$VNC_DISPLAY" -geometry 1600x900 -depth 24 -localhost no
-          vncserver -list
+          # Verify the password actually took
+          Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+          $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Machine')
+          $ok = $ctx.ValidateCredentials($NewUser, $env:VNC_PASSWORD)
+          if ($ok) { Write-Host "OK: '$NewUser' accepts the secret password" }
+          else { Write-Error "'$NewUser' does not accept the secret password" }
 
-          for _ in $(seq 1 15); do
-            nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null && break
-            sleep 2
-          done
-          nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null || { echo "::error::VNC port $VNC_PORT did not open"; exit 1; }
-          echo "VNC is listening on port $VNC_PORT"
-
-      - name: Enable SSH login
-        env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+      - name: Enable Remote Desktop
         run: |
-          echo "runner:$VNC_PASSWORD" | sudo chpasswd
-          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl enable --now ssh
-          sudo systemctl restart ssh
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          # Disable Network Level Authentication so mobile RDP clients connect without extra fuss
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
 
-          for _ in $(seq 1 15); do
-            nc -z 127.0.0.1 22 2>/dev/null && break
-            sleep 2
-          done
-          nc -z 127.0.0.1 22 2>/dev/null || { echo "::error::sshd is not listening on port 22"; exit 1; }
-          echo "sshd is listening on port 22 (user: runner)"
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Set-NetFirewallRule -Enabled True -Profile Any
+
+          $ok = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            if (Test-NetConnection -ComputerName 127.0.0.1 -Port $env:RDP_PORT -InformationLevel Quiet -WarningAction SilentlyContinue) {
+              $ok = $true
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ok) {
+            Write-Error "RDP port $($env:RDP_PORT) is not listening"
+            exit 1
+          }
+          Write-Host "RDP is listening on port $($env:RDP_PORT)"
 
       - name: Install and start Tailscale
         env:
           TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up \
-            --authkey="$TS_AUTHKEY" \
-            --hostname="gh-linux-$(date +%s | tail -c 6)" \
-            --accept-dns=true \
-            --timeout=60s
+          choco install tailscale -y --no-progress | Out-Null
 
-          TS_IP=""
-          for _ in $(seq 1 15); do
-            TS_IP=$(tailscale ip -4 2>/dev/null || true)
-            [ -n "$TS_IP" ] && break
-            sleep 2
-          done
-          if [ -z "$TS_IP" ]; then
-            echo "::error::Tailscale did not come up"
-            sudo tailscale status || true
+          Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) {
+            $tailscale = "tailscale"  # fall back to PATH
+          }
+
+          $hostName = "gh-win-" + (Get-Random -Maximum 999999)
+          & $tailscale up --authkey="$env:TS_AUTHKEY" --hostname="$hostName" --accept-dns=true --timeout=60s
+
+          $tsIp = ""
+          for ($i = 0; $i -lt 15; $i++) {
+            $tsIp = (& $tailscale ip -4 2>$null | Select-Object -First 1)
+            if ($tsIp) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $tsIp) {
+            Write-Error "Tailscale did not come up"
+            & $tailscale status
             exit 1
-          fi
+          }
 
-          TS_DNS=$(tailscale status --json 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("Self",{}).get("DNSName","").rstrip("."))' 2>/dev/null || true)
+          $tsDns = ""
+          try {
+            $status = (& $tailscale status --json) | ConvertFrom-Json
+            $tsDns = $status.Self.DNSName.TrimEnd('.')
+          } catch {}
 
-          echo "VNC_ENDPOINT: $TS_IP:$VNC_PORT"
-          echo "SSH: ssh runner@$TS_IP"
-          {
-            echo "### Connect from your phone"
-            echo '```'
-            echo "VNC  -> Host: $TS_IP   Port: $VNC_PORT"
-            [ -n "$TS_DNS" ] && echo "       (or host: $TS_DNS)"
-            echo "SSH  -> ssh runner@$TS_IP"
-            echo '```'
-            echo "Password (both VNC and SSH): your VNC_PASSWORD secret"
-            echo
-            echo "Your phone must have the Tailscale app installed and signed into the same account."
-          } >> "$GITHUB_STEP_SUMMARY"
+          Write-Host "RDP_ENDPOINT: $tsIp`:$($env:RDP_PORT)"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value @"
+### Connect from your phone (Microsoft Remote Desktop app)
+
+``````
+Host: $tsIp
+$(if ($tsDns) { "# or host: $tsDns" })
+Port: 3389
+User: ciadmin
+``````
+Password: your VNC_PASSWORD secret
+
+Your phone must have the Tailscale app installed and signed into the same account.
+"@
 
       - name: Keep alive
         run: |
-          END=$(( $(date +%s) + SESSION_MINUTES * 60 ))
-          NEXT_REPORT=$(( $(date +%s) + 1800 ))
-          echo "Session: $SESSION_MINUTES min. Cancel the run to stop it early."
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscale)) { $tailscale = "tailscale" }
 
-          while [ "$(date +%s)" -lt "$END" ]; do
-            sleep 30
+          $end = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
+          $nextReport = (Get-Date).AddMinutes(30)
+          Write-Host "Session: $($env:SESSION_MINUTES) min. Cancel the run to stop it early."
 
-            if ! nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null; then
-              echo "::warning::VNC died, restarting..."
-              vncserver ":$VNC_DISPLAY" -geometry 1600x900 -depth 24 -localhost no || true
-            fi
-            if ! sudo tailscale status >/dev/null 2>&1; then
-              echo "::warning::tailscaled looks down, restarting..."
-              sudo systemctl restart tailscaled || true
-              sleep 5
-            fi
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 30
 
-            NOW=$(date +%s)
-            if [ "$NOW" -ge "$NEXT_REPORT" ]; then
-              TS_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
-              echo "VNC_ENDPOINT: $TS_IP:$VNC_PORT  (~$(( (END - NOW) / 60 )) min left)"
-              NEXT_REPORT=$(( NOW + 1800 ))
-            fi
-          done
+            if (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port $env:RDP_PORT -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+              Write-Warning "RDP service looks down, restarting..."
+              Restart-Service -Name TermService -ErrorAction SilentlyContinue
+            }
 
-          echo "Session finished."
+            & $tailscale status *> $null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "tailscaled looks down, restarting service..."
+              Restart-Service -Name Tailscale -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 5
+            }
+
+            if ((Get-Date) -ge $nextReport) {
+              $tsIp = (& $tailscale ip -4 2>$null | Select-Object -First 1)
+              $minsLeft = [int](($end - (Get-Date)).TotalMinutes)
+              Write-Host "RDP_ENDPOINT: $tsIp`:$($env:RDP_PORT)  (~$minsLeft min left)"
+              $nextReport = (Get-Date).AddMinutes(30)
+            }
+          }
+          Write-Host "Session finished."
