@@ -137,19 +137,20 @@ jobs:
           } catch {}
 
           Write-Host "RDP_ENDPOINT: $tsIp`:$($env:RDP_PORT)"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value @"
-### Connect from your phone (Microsoft Remote Desktop app)
 
-``````
-Host: $tsIp
-$(if ($tsDns) { "# or host: $tsDns" })
-Port: 3389
-User: ciadmin
-``````
-Password: your VNC_PASSWORD secret
-
-Your phone must have the Tailscale app installed and signed into the same account.
-"@
+          $lines = @()
+          $lines += "### Connect from your phone (Microsoft Remote Desktop app)"
+          $lines += ""
+          $lines += '```'
+          $lines += "Host: $tsIp"
+          if ($tsDns) { $lines += "# or host: $tsDns" }
+          $lines += "Port: 3389"
+          $lines += "User: ciadmin"
+          $lines += '```'
+          $lines += "Password: your VNC_PASSWORD secret"
+          $lines += ""
+          $lines += "Your phone must have the Tailscale app installed and signed into the same account."
+          ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Keep alive
         run: |
