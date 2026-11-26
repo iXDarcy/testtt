@@ -1,0 +1,161 @@
+name: Linux RDP (VNC via Tailscale)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Session length in minutes (1-350)'
+        required: false
+        default: '300'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-rdp
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      VNC_DISPLAY: '1'
+      VNC_PORT: '5901'
+    steps:
+      - name: Validate secrets and inputs
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          MINUTES_IN: ${{ inputs.minutes }}
+        run: |
+          [ -n "$VNC_PASSWORD" ] || { echo "::error::VNC_PASSWORD secret is not set"; exit 1; }
+          [ -n "$TS_AUTHKEY" ] || { echo "::error::TS_AUTHKEY secret is not set (Tailscale admin console -> Settings -> Keys)"; exit 1; }
+          MINUTES="${MINUTES_IN:-300}"
+          case "$MINUTES" in ''|*[!0-9]*) MINUTES=300 ;; esac
+          [ "$MINUTES" -lt 1 ] && MINUTES=1
+          [ "$MINUTES" -gt 350 ] && MINUTES=350
+          echo "SESSION_MINUTES=$MINUTES" >> "$GITHUB_ENV"
+
+      - name: Install desktop, VNC and SSH
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xfce4 xfce4-goodies dbus-x11 \
+            tigervnc-standalone-server tigervnc-common \
+            openssh-server
+
+      - name: Configure and start VNC desktop
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          mkdir -p ~/.vnc
+          echo "$VNC_PASSWORD" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+
+          cat > ~/.vnc/xstartup <<'EOF'
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          exec startxfce4
+          EOF
+          chmod +x ~/.vnc/xstartup
+
+          vncserver ":$VNC_DISPLAY" -geometry 1600x900 -depth 24 -localhost no
+          vncserver -list
+
+          for _ in $(seq 1 15); do
+            nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null && break
+            sleep 2
+          done
+          nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null || { echo "::error::VNC port $VNC_PORT did not open"; exit 1; }
+          echo "VNC is listening on port $VNC_PORT"
+
+      - name: Enable SSH login
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          echo "runner:$VNC_PASSWORD" | sudo chpasswd
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
+
+          for _ in $(seq 1 15); do
+            nc -z 127.0.0.1 22 2>/dev/null && break
+            sleep 2
+          done
+          nc -z 127.0.0.1 22 2>/dev/null || { echo "::error::sshd is not listening on port 22"; exit 1; }
+          echo "sshd is listening on port 22 (user: runner)"
+
+      - name: Install and start Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up \
+            --authkey="$TS_AUTHKEY" \
+            --hostname="gh-linux-$(date +%s | tail -c 6)" \
+            --accept-dns=true \
+            --timeout=60s
+
+          TS_IP=""
+          for _ in $(seq 1 15); do
+            TS_IP=$(tailscale ip -4 2>/dev/null || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::Tailscale did not come up"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          TS_DNS=$(tailscale status --json 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("Self",{}).get("DNSName","").rstrip("."))' 2>/dev/null || true)
+
+          echo "VNC_ENDPOINT: $TS_IP:$VNC_PORT"
+          echo "SSH: ssh runner@$TS_IP"
+          {
+            echo "### Connect from your phone"
+            echo '```'
+            echo "VNC  -> Host: $TS_IP   Port: $VNC_PORT"
+            [ -n "$TS_DNS" ] && echo "       (or host: $TS_DNS)"
+            echo "SSH  -> ssh runner@$TS_IP"
+            echo '```'
+            echo "Password (both VNC and SSH): your VNC_PASSWORD secret"
+            echo
+            echo "Your phone must have the Tailscale app installed and signed into the same account."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep alive
+        run: |
+          END=$(( $(date +%s) + SESSION_MINUTES * 60 ))
+          NEXT_REPORT=$(( $(date +%s) + 1800 ))
+          echo "Session: $SESSION_MINUTES min. Cancel the run to stop it early."
+
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 30
+
+            if ! nc -z 127.0.0.1 "$VNC_PORT" 2>/dev/null; then
+              echo "::warning::VNC died, restarting..."
+              vncserver ":$VNC_DISPLAY" -geometry 1600x900 -depth 24 -localhost no || true
+            fi
+            if ! sudo tailscale status >/dev/null 2>&1; then
+              echo "::warning::tailscaled looks down, restarting..."
+              sudo systemctl restart tailscaled || true
+              sleep 5
+            fi
+
+            NOW=$(date +%s)
+            if [ "$NOW" -ge "$NEXT_REPORT" ]; then
+              TS_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
+              echo "VNC_ENDPOINT: $TS_IP:$VNC_PORT  (~$(( (END - NOW) / 60 )) min left)"
+              NEXT_REPORT=$(( NOW + 1800 ))
+            fi
+          done
+
+          echo "Session finished."
